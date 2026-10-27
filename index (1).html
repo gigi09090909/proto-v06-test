@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>STUDY OS V0.6 · Prototipo isolato import/recupero (rev. 2B)</title>
+<style>body{font:14px system-ui,sans-serif;max-width:760px;margin:20px auto;padding:0 16px;line-height:1.45}button,input{font:inherit;margin:2px 0}pre{background:#f3f3f3;padding:10px;overflow:auto;white-space:pre-wrap;word-break:break-word}.warn{border-left:4px solid #b45309;padding:6px 10px;background:#fff7ed}button{min-height:44px;padding:6px 12px;margin:4px 4px 4px 0}li{margin:8px 0}textarea{width:100%;font:12px ui-monospace,monospace}.muted{color:#555}.ok{color:#166534}.ko{color:#991b1b}section{border-top:1px solid #ddd;margin-top:14px;padding-top:6px}</style>
+</head>
+<body>
+<h1>Prototipo isolato · importazione e recupero <small>(rev. 2B)</small></h1>
+<p class="warn"><b>Non è STUDY OS.</b> È un banco di prova del protocollo a generazioni (specifica V0.6 rev. 4, §4.2–4.4). Usa solo chiavi <code>PROTO_*</code> e database <code>proto_study_os_v06_g*</code>: non tocca i dati della r3, neanche sullo stesso indirizzo. Solo dati sintetici.</p>
+<section><h2>1 · Diagnostica</h2>
+<div id="diag">controllo…</div>
+<button id="g-diag">Ripeti la diagnostica</button>
+</section>
+<section><h2>2 · Collaudo guidato</h2>
+<p class="muted">Esegui i passi nell'ordine. Usano solo dati sintetici dentro questo prototipo.</p>
+<ol>
+<li><button id="g-a">A · Esporta, modifica, importa</button><br><span class="muted">Deve ritrovare lo stato esportato.</span></li>
+<li><button id="g-b">B · Interrompi un'importazione</button> <button id="g-reload" hidden>Ricarica la pagina</button><br><span class="muted">Simula un'interruzione a metà, poi ricarica: deve tornare allo stato di prima.</span></li>
+<li><button id="g-c">C · Importazione lenta</button> <button id="g-probe">Seconda scheda: prova</button><br><span class="muted">Premi C; mentre il conto alla rovescia corre, apri una <b>seconda scheda</b> dello stesso indirizzo e premi «Seconda scheda: prova». Deve dire che l'operazione è in corso.</span></li>
+</ol>
+<pre id="guided-out"></pre>
+<div id="results"></div>
+<h3>Rapporto da incollare nella chat</h3>
+<textarea id="report" readonly rows="12"></textarea>
+<button id="g-report">Aggiorna il rapporto</button>
+</section>
+<section><h2>3 · Strumenti manuali</h2></section>
+<div>
+  <button id="b-seed">Dati di esempio</button>
+  <button id="b-export">Esporta backup</button>
+  <label>Importa: <input type="file" id="f-import" accept=".json"></label>
+  <button id="b-recover">Recupera</button>
+  <button id="b-status">Stato</button>
+</div>
+<pre id="out">avvio…</pre>
+<script>
+(() => {
+'use strict';
+const NS = 'PROTO_';
+const K = { V01: NS + 'V01', UNITS: NS + 'V04_UNITS', GEN: NS + 'V06_ACTIVE_GEN', J: NS + 'V06_JOURNAL', LOG: NS + 'V06_LAST_RECOVERY', DISC: NS + 'V06_DISCARDED', PREV: NS + 'V06_PREV_' };
+const DBP = 'proto_study_os_v06_g';
+const LOCK = 'proto_study_os_v06';
+const COLS = ['lessons', 'sources', 'versions', 'exposures', 'attempts', 'changelog'];
+const CRASH = new Error('CRASH_SIMULATO');
+
+/* ---------- utilità ---------- */
+const enc = new TextEncoder();
+const sha = async s => [...new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(s)))].map(b => b.toString(16).padStart(2, '0')).join('');
+const canon = v => JSON.stringify(v, (k, x) => x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : x);
+const lsGet = k => localStorage.getItem(k);
+function lsSet(k, v) { if (lsGet(k) === v) return; localStorage.setItem(k, v); if (lsGet(k) !== v) throw new Error('verifica di scrittura fallita: ' + k); }
+function lsDel(k) { localStorage.removeItem(k); if (lsGet(k) !== null) throw new Error('rimozione fallita: ' + k); }
+function lsPut(k, v) { v === null ? lsDel(k) : lsSet(k, v); }
+const recId = (c, r) => c === 'changelog' ? r.seq : r.rid;
+const sortRecs = (c, a) => [...a].sort((x, y) => String(recId(c, x)).localeCompare(String(recId(c, y)), 'en', { numeric: true }));
+
+/* ---------- guasti simulati (solo per i test) ---------- */
+async function fp(id) {
+  const f = window.__fault; if (!f || f.at !== id) return;
+  if (f.mode === 'crash') throw CRASH;
+  if (f.mode === 'error') throw new Error('guasto simulato ' + id);
+  if (f.mode === 'pause') { window.__paused = id; await new Promise(r => { window.__resume = r; }); window.__paused = null; }
+}
+function fps(id) { // versione sincrona, usabile dentro una transazione IndexedDB
+  const f = window.__fault; if (!f || f.at !== id) return;
+  if (f.mode === 'crash') throw CRASH;
+  if (f.mode === 'error') throw new Error('guasto simulato ' + id);
+}
+(() => { const m = /[?&]fault=([A-Za-z0-9]+):(crash|error|pause)/.exec(location.search); if (m) window.__fault = { at: m[1], mode: m[2] }; })();
+
+/* ---------- IndexedDB, un database per generazione ---------- */
+const dbName = g => DBP + g;
+const genOf = n => Number(n.slice(DBP.length));
+const reqP = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+async function listDbs() {
+  if (!indexedDB.databases) throw new Error('indexedDB.databases() non disponibile in questo browser');
+  return (await indexedDB.databases()).map(d => d.name).filter(n => n && n.startsWith(DBP));
+}
+function openDb(g, create) {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(dbName(g), 1);
+    r.onupgradeneeded = () => {
+      if (!create) { r.transaction.abort(); return; }
+      for (const c of COLS) r.result.createObjectStore(c, c === 'changelog' ? { keyPath: 'seq', autoIncrement: true } : { keyPath: 'rid' });
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error || new Error('apertura archivio fallita'));
+    r.onblocked = () => rej(new Error('apertura archivio bloccata'));
+  });
+}
+async function dumpDb(g) {
+  const db = await openDb(g, false);
+  try {
+    const tx = db.transaction(COLS, 'readonly'); const out = {};
+    await Promise.all(COLS.map(async c => { out[c] = sortRecs(c, await reqP(tx.objectStore(c).getAll())); }));
+    return out;
+  } finally { db.close(); }
+}
+async function summarize(cols) {
+  const counts = {}, hashes = {};
+  for (const c of COLS) { counts[c] = cols[c].length; hashes[c] = await sha(canon(sortRecs(c, cols[c]))); }
+  return { counts, hashes };
+}
+async function writeDb(g, cols) { // una sola transazione: atomica dentro questo archivio
+  const db = await openDb(g, true);
+  try {
+    await new Promise((res, rej) => {
+      const tx = db.transaction(COLS, 'readwrite');
+      tx.oncomplete = res; tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error || new Error('transazione annullata'));
+      try { let n = 0; for (const c of COLS) { const os = tx.objectStore(c); for (const r of cols[c]) { os.put(r); if (++n === 2) fps('P3a'); } } }
+      catch (e) { try { tx.abort(); } catch (_) { } rej(e); }
+    });
+  } finally { db.close(); }
+}
+async function emptyDb(g) { const d = await dumpDb(g); return COLS.every(c => d[c].length === 0); }
+
+/* ---------- blocchi (Web Locks) ---------- */
+function gateCheck() {
+  const miss = [];
+  if (!window.isSecureContext) miss.push('contesto sicuro (serve HTTPS attendibile o localhost)');
+  if (!(navigator.locks && typeof navigator.locks.request === 'function')) miss.push('navigator.locks');
+  if (!(typeof indexedDB !== 'undefined' && indexedDB && typeof indexedDB.databases === 'function')) miss.push('indexedDB.databases()');
+  if (!(window.crypto && crypto.subtle && typeof crypto.subtle.digest === 'function')) miss.push('crypto.subtle');
+  try { if (!window.localStorage) miss.push('localStorage'); } catch (_) { miss.push('localStorage (accesso negato)'); }
+  return { ok: miss.length === 0, missing: miss, message: miss.length ? 'Funzioni necessarie non disponibili: ' + miss.join('; ') + '. Non ho creato né modificato alcun archivio. Apri la pagina da un indirizzo HTTPS attendibile o da localhost.' : '' };
+}
+async function withLock(mode, fn) {
+  const gate = gateCheck(); if (!gate.ok) return { ok: false, state: 'unsupported', missing: gate.missing, message: gate.message };
+  return navigator.locks.request(LOCK, { mode, ifAvailable: true }, async lock => {
+    if (!lock) return { ok: false, busy: true, message: 'operazione in corso in un\'altra scheda: nessuna lettura né scrittura' };
+    return fn();
+  });
+}
+
+/* ---------- classificazione dello stato (sola lettura) ---------- */
+async function inspect() {
+  const j = lsGet(K.J), g = lsGet(K.GEN), dbs = await listDbs();
+  if (j !== null) return { name: 'needs_recovery', message: 'operazione interrotta: recupero necessario' };
+  if (g === null) {
+    if (dbs.length === 0) return { name: 'fresh' };
+    if (dbs.length === 1 && dbs[0] === dbName(1) && await emptyDb(1)) return { name: 'fresh' }; // prima esecuzione interrotta: archivio vuoto adottabile
+    return { name: 'blocked', message: 'esistono archivi ma nessuna generazione attiva: non modifico nulla' };
+  }
+  const gi = Number(g);
+  if (!Number.isInteger(gi) || gi < 1) return { name: 'blocked', message: 'generazione attiva non valida: non modifico nulla' };
+  if (!dbs.includes(dbName(gi))) return { name: 'archive_missing', message: 'archivio lezioni non trovato (generazione ' + gi + '): non creo un archivio vuoto; importa un backup' };
+  return { name: 'ready', gen: gi };
+}
+async function initFresh() {
+  const dbs = await listDbs();
+  if (!dbs.includes(dbName(1))) { const d = await openDb(1, true); d.close(); }
+  lsSet(K.GEN, '1');
+}
+
+/* ---------- recupero (dal giornale) ---------- */
+const FASI = ['preparazione', 'scrittura_ls', 'pronto_al_commit', 'completato'];
+function discard(gen) { let d = []; try { d = JSON.parse(lsGet(K.DISC) || '[]'); } catch (_) { } if (!d.includes(gen)) d.push(gen); lsSet(K.DISC, JSON.stringify(d)); }
+const block = msg => ({ action: 'blocked', consistent: false, message: msg + ' — non ho modificato nulla; scritture bloccate; ripristina da un backup' });
+async function restoreKeys(prev) {
+  lsPut(K.V01, prev.v01); await fp('R2');
+  lsPut(K.UNITS, prev.units); await fp('R3');
+}
+async function recoverCore() {
+  const raw = lsGet(K.J);
+  if (raw === null) return { action: 'none' };
+  let j; try { j = JSON.parse(raw); } catch (_) { return block('giornale illeggibile'); }
+  const okShape = j && typeof j === 'object' && typeof j.batch === 'string' && FASI.includes(j.fase) && Number.isInteger(j.gen_nuova) && Number.isInteger(j.gen_precedente) && j.gen_nuova > j.gen_precedente && typeof j.prev_sha === 'string' && typeof j.prev_db_present === 'boolean' && j.expected && j.expected.counts && j.expected.hashes && 'v01_sha' in j.expected && 'units_sha' in j.expected;
+  if (!okShape) return block('giornale non valido');
+  const g = Number(lsGet(K.GEN));
+  if (g !== j.gen_precedente && g !== j.gen_nuova) return block('generazione attiva incoerente con il giornale');
+  if (j.fase === 'completato') { lsDel(K.J); return { action: 'cleanup', consistent: true }; }
+  const dbs = await listDbs();
+  const prevRaw = lsGet(K.PREV + j.batch);
+  const prevOk = async () => { if (prevRaw === null) return false; return (await sha(prevRaw)) === j.prev_sha; };
+  const done = (action) => { lsSet(K.LOG, JSON.stringify({ at: new Date().toISOString(), action, batch: j.batch })); lsDel(K.J); return { action, consistent: true }; };
+
+  if (g === j.gen_nuova) {
+    let okNew = dbs.includes(dbName(j.gen_nuova));
+    if (okNew) {
+      const s = await summarize(await dumpDb(j.gen_nuova));
+      const v01 = lsGet(K.V01), un = lsGet(K.UNITS);
+      okNew = canon(s) === canon({ counts: j.expected.counts, hashes: j.expected.hashes })
+        && v01 !== null && (await sha(v01)) === j.expected.v01_sha
+        && (un === null ? j.expected.units_sha === null : (await sha(un)) === j.expected.units_sha);
+    }
+    await fp('R4');
+    if (okNew) return done('roll-forward');
+    // il nuovo stato non è verificabile: si torna al precedente
+    if (!(await prevOk())) return block('stato nuovo non verificabile e copia di sicurezza assente o alterata');
+    if (j.prev_db_present && !dbs.includes(dbName(j.gen_precedente))) return block('archivio precedente non trovato');
+    lsSet(K.GEN, String(j.gen_precedente)); await fp('R1');
+    await restoreKeys(JSON.parse(prevRaw)); discard(j.gen_nuova);
+    return done('rollback_dopo_commit');
+  }
+  // g === gen_precedente: il commit non è avvenuto
+  if (!(await prevOk())) return block('copia di sicurezza assente o alterata');
+  await restoreKeys(JSON.parse(prevRaw)); discard(j.gen_nuova);
+  return done('rollback');
+}
+
+/* ---------- validazione del backup (fase 0) ---------- */
+const bad = error => ({ ok: false, error });
+async function validateBackup(b) {
+  try {
+    if (!b || typeof b !== 'object') return bad('il file non è un oggetto');
+    if (b.format !== 'proto-backup-v06') return bad('formato non riconosciuto');
+    if (typeof b.v01 !== 'string') return bad('manca v01'); try { JSON.parse(b.v01); } catch (_) { return bad('v01 non è JSON valido'); }
+    if (!(b.units === null || typeof b.units === 'string')) return bad('units non valido');
+    if (b.units !== null) { try { JSON.parse(b.units); } catch (_) { return bad('units non è JSON valido'); } }
+    if (!b.collections || typeof b.collections !== 'object') return bad('mancano le collezioni');
+    for (const c of COLS) {
+      const a = b.collections[c]; if (!Array.isArray(a)) return bad('collezione mancante: ' + c);
+      const seen = new Set();
+      for (const r of a) {
+        if (!r || typeof r !== 'object') return bad('record non valido in ' + c);
+        const id = recId(c, r);
+        if (c === 'changelog' ? !Number.isInteger(id) : typeof id !== 'string') return bad('identificativo mancante o non valido in ' + c);
+        if (seen.has(id)) return bad('identificativo duplicato in ' + c); seen.add(id);
+      }
+    }
+    const m = b.manifest; if (!m || !m.counts || !m.hashes) return bad('manifest mancante');
+    const sorted = {}; for (const c of COLS) sorted[c] = sortRecs(c, b.collections[c]);
+    const s = await summarize(sorted);
+    for (const c of COLS) { if (m.counts[c] !== s.counts[c]) return bad('conteggio non coerente: ' + c); if (m.hashes[c] !== s.hashes[c]) return bad('hash non coerente: ' + c); }
+    if (m.v01_sha !== await sha(b.v01)) return bad('hash v01 non coerente');
+    if (m.units_sha !== (b.units === null ? null : await sha(b.units))) return bad('hash units non coerente');
+    return { ok: true, summary: s, sorted };
+  } catch (e) { return bad('validazione fallita: ' + e.message); }
+}
+
+/* ---------- operazioni ---------- */
+async function exportBackup() {
+  return withLock('shared', async () => {
+    const st = await inspect(); if (st.name !== 'ready') return { ok: false, state: st.name, message: st.message };
+    for (let tent = 0; tent < 3; tent++) {
+      const a = [lsGet(K.GEN), lsGet(K.V01), lsGet(K.UNITS)];
+      const cols = await dumpDb(st.gen);
+      const b = [lsGet(K.GEN), lsGet(K.V01), lsGet(K.UNITS)];
+      if (canon(a) !== canon(b)) continue; // qualcosa è cambiato durante la lettura: si ripete
+      const s = await summarize(cols);
+      const out = { format: 'proto-backup-v06', created: new Date().toISOString(), manifest: { ...s, v01_sha: a[1] === null ? null : await sha(a[1]), units_sha: a[2] === null ? null : await sha(a[2]) }, v01: a[1], units: a[2], collections: cols };
+      if (out.v01 === null) return { ok: false, error: 'nessun dato v01 da esportare' };
+      const re = JSON.parse(JSON.stringify(out)); const v = await validateBackup(re); // rilettura prima di consegnare il file
+      if (!v.ok) return { ok: false, error: 'il backup prodotto non supera la verifica: ' + v.error };
+      return { ok: true, backup: out };
+    }
+    return { ok: false, error: 'dati modificati durante la lettura' };
+  });
+}
+
+async function importBackup(b, opts = {}) {
+  return withLock('exclusive', async () => {
+    const v = await validateBackup(b); if (!v.ok) return { ok: false, stage: 'validazione', error: v.error }; // fase 0: nessuna scrittura
+    let st = await inspect();
+    if (st.name === 'needs_recovery' || st.name === 'blocked') {
+      // Uscita dal blocco: solo con conferma esplicita dell'utente che lo stato attuale è danneggiato.
+      if (!opts.confirmDamaged) return { ok: false, stage: 'stato', error: 'stato «' + st.name + '»: recupero non possibile in automatico; serve un backup e la conferma esplicita' };
+      const dump = {}; for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith(NS)) dump[k] = localStorage.getItem(k); }
+      lsSet(NS + 'V06_QUAR_' + Date.now().toString(36), JSON.stringify(dump)); // copia di tutto ciò che c'era, prima di toccare qualsiasi cosa
+      if (lsGet(K.J) !== null) lsDel(K.J);
+      const mx = Math.max(0, ...(await listDbs()).map(genOf).filter(Number.isInteger));
+      if (mx === 0) lsDel(K.GEN); else lsSet(K.GEN, String(mx));
+      st = await inspect();
+    }
+    if (st.name === 'fresh') { await initFresh(); st = await inspect(); }
+    await fp('P0');
+    const genPrev = Number(lsGet(K.GEN));
+    const dbsBefore = await listDbs();
+    const genNew = Math.max(genPrev, ...dbsBefore.map(genOf).filter(Number.isInteger)) + 1;
+    const prevDbPresent = dbsBefore.includes(dbName(genPrev));
+    const batch = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const prevRaw = JSON.stringify({ v01: lsGet(K.V01), units: lsGet(K.UNITS) });
+    const expected = { counts: v.summary.counts, hashes: v.summary.hashes, v01_sha: await sha(b.v01), units_sha: b.units === null ? null : await sha(b.units) };
+    try {
+      lsSet(K.PREV + batch, prevRaw); await fp('P1');                                   // fase 1: copia dello stato attuale (verificata)
+      const j = { batch, fase: 'preparazione', gen_nuova: genNew, gen_precedente: genPrev, prev_db_present: prevDbPresent, prev_sha: await sha(prevRaw), expected, at: new Date().toISOString() };
+      lsSet(K.J, JSON.stringify(j)); await fp('P2');                                     // fase 2: giornale
+      await writeDb(genNew, v.sorted); await fp('P3b');                                  // fase 3: nuovo archivio, una transazione
+      const chk = await summarize(await dumpDb(genNew));
+      if (canon(chk) !== canon({ counts: expected.counts, hashes: expected.hashes })) throw new Error('verifica del nuovo archivio fallita');
+      await fp('P3c');
+      j.fase = 'scrittura_ls'; lsSet(K.J, JSON.stringify(j));                            // fase 4: chiavi localStorage
+      lsPut(K.V01, b.v01); await fp('P4a');
+      lsPut(K.UNITS, b.units); await fp('P4b');
+      j.fase = 'pronto_al_commit'; lsSet(K.J, JSON.stringify(j)); await fp('P4c');
+      await fp('P5a'); lsSet(K.GEN, String(genNew)); await fp('P5b');                    // fase 5: COMMIT (una sola chiave)
+      j.fase = 'completato'; lsSet(K.J, JSON.stringify(j)); await fp('P5c');
+      lsDel(K.J); await fp('P6');                                                        // fase 6: pulizia del giornale
+      return { ok: true, gen: genNew };
+    } catch (e) {
+      if (e === CRASH) throw e;                                                          // un crash non esegue alcuna pulizia
+      const r = await recoverCore();                                                     // stessa logica del recupero all'avvio
+      const ok = r.action !== 'blocked' && Number(lsGet(K.GEN)) === genNew;
+      return { ok, error: e.message, recovery: r };
+    }
+  });
+}
+
+async function importNaive(b) { // SOLO per dimostrare che i test discriminano: scrive le chiavi, poi l'archivio, senza giornale
+  return withLock('exclusive', async () => {
+    const v = await validateBackup(b); if (!v.ok) return { ok: false, error: v.error };
+    let st = await inspect(); if (st.name === 'fresh') { await initFresh(); }
+    const genPrev = Number(lsGet(K.GEN));
+    lsPut(K.V01, b.v01); lsPut(K.UNITS, b.units); await fp('N1');
+    const genNew = genPrev + 1; await writeDb(genNew, v.sorted); await fp('N2');
+    lsSet(K.GEN, String(genNew)); return { ok: true };
+  });
+}
+
+async function put(col, rec) { // scrittura ordinaria: dato + voce di registro nella stessa transazione
+  return withLock('shared', async () => {
+    const st = await inspect(); if (st.name !== 'ready') return { ok: false, state: st.name, message: st.message };
+    if (!COLS.includes(col) || col === 'changelog') return { ok: false, error: 'collezione non valida' };
+    const db = await openDb(st.gen, false);
+    try {
+      await new Promise((res, rej) => {
+        const tx = db.transaction([col, 'changelog'], 'readwrite');
+        tx.oncomplete = res; tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error || new Error('transazione annullata'));
+        try { tx.objectStore(col).put(rec); fps('PUT1'); tx.objectStore('changelog').add({ rid: rec.rid, op: 'put', col, at: new Date().toISOString() }); }
+        catch (e) { try { tx.abort(); } catch (_) { } rej(e); }
+      });
+      return { ok: true };
+    } catch (e) { return { ok: false, error: e.message }; } finally { db.close(); }
+  });
+}
+async function setLegacy(which, val) { // imita il salvataggio di impegni/unità della r3
+  return withLock('shared', async () => {
+    const st = await inspect(); if (st.name !== 'ready') return { ok: false, state: st.name, message: st.message };
+    try { const key = which === 'v01' ? K.V01 : K.UNITS; lsSet(key, val === undefined ? lsGet(key) : val); return { ok: true }; } catch (e) { return { ok: false, error: e.message }; }
+  });
+}
+async function readAll() {
+  return withLock('shared', async () => {
+    const st = await inspect(); if (st.name !== 'ready') return { ok: false, state: st.name, message: st.message };
+    return { ok: true, gen: st.gen, v01: lsGet(K.V01), units: lsGet(K.UNITS), cols: await dumpDb(st.gen) };
+  });
+}
+
+/* ---------- avvio ---------- */
+let bootInfo = { state: 'init' };
+async function boot() {
+  const r = await withLock('exclusive', async () => {
+    let st = await inspect(), recovery = null;
+    if (st.name === 'needs_recovery') {
+      recovery = await recoverCore();
+      if (recovery.action === 'blocked') return { state: 'blocked', consistent: false, message: recovery.message, recovery };
+      st = await inspect();
+    }
+    if (st.name === 'fresh') { await initFresh(); st = await inspect(); }
+    return { state: st.name, message: st.message, recovery };
+  });
+  bootInfo = r.busy ? { state: 'busy', ...r } : r;
+  return bootInfo;
+}
+async function status() { const gate = gateCheck(); if (!gate.ok) return { inspect: { name: 'unsupported', message: gate.message }, boot: bootInfo, log: null, discarded: null }; return withLock('shared', async () => { const st = await inspect(); return { inspect: st, boot: bootInfo, log: lsGet(K.LOG), discarded: lsGet(K.DISC) }; }); }
+
+/* ---------- aiuti per i test ---------- */
+async function snapshot() {
+  const ls = {}; for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith(NS)) ls[k] = localStorage.getItem(k); }
+  const dbs = {}; for (const n of await listDbs()) dbs[n] = await dumpDb(genOf(n));
+  return canon({ ls, dbs });
+}
+async function createDbOnly(g) { const d = await openDb(g, true); d.close(); }
+
+window.PROTO = { gateCheck, diagnose: () => diagnose(), K, COLS, boot, status, exportBackup, importBackup, importNaive, put, setLegacy, readAll, recoverNow: () => withLock('exclusive', recoverCore), validateBackup, _snapshot: snapshot, _createDbOnly: createDbOnly, _canon: canon };
+window.PROTO.ready = /[?&]noboot=1/.test(location.search) ? Promise.resolve({ state: 'noboot' }) : boot();
+
+/* ---------- interfaccia minima ---------- */
+const out = document.getElementById('out'); const show = o => { out.textContent = typeof o === 'string' ? o : JSON.stringify(o, null, 2); };
+window.PROTO.ready.then(s => show(s), e => show('errore all\'avvio: ' + e.message));
+document.getElementById('b-status').onclick = async () => show(await status());
+document.getElementById('b-recover').onclick = async () => show(await boot());
+document.getElementById('b-seed').onclick = async () => {
+  const r1 = await setLegacy('v01', JSON.stringify({ tasks: [{ id: 't1', title: 'esempio' }] })); const r2 = await setLegacy('units', JSON.stringify([{ id: 'u1', title: 'unità di esempio' }]));
+  const r3 = await put('lessons', { rid: 'les_' + Date.now().toString(36), title: 'Lezione di esempio' }); show({ r1, r2, r3 });
+};
+document.getElementById('b-export').onclick = async () => {
+  const r = await exportBackup(); if (!r.ok) return show(r);
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(r.backup, null, 2)], { type: 'application/json' })); a.download = 'PROTO_BACKUP_V06.json'; a.click(); show('backup avviato; controlla la cartella Download');
+};
+document.getElementById('f-import').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return; let b; try { b = JSON.parse(await f.text()); } catch (_) { return show('il file non è JSON valido: nessuna modifica'); }
+  show(await importBackup(b));
+};
+
+/* ---------- rev. 2: diagnostica e collaudo guidato ---------- */
+const SLOW_MS = (() => { const m = /[?&]slowms=(\d+)/.exec(location.search); return m ? Number(m[1]) : 25000; })();
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+async function diagnose() {
+  const items = []; const add = (nome, ok, dettaglio, richiesto = true) => items.push({ nome, ok: !!ok, dettaglio: String(dettaglio), richiesto });
+  const d = { at: new Date().toISOString(), origin: location.origin, protocollo: location.protocol, host: location.hostname, isSecureContext: !!window.isSecureContext, userAgent: navigator.userAgent, items };
+  add('Contesto sicuro (isSecureContext)', window.isSecureContext, window.isSecureContext ? 'sì' : 'NO: serve HTTPS attendibile o localhost; senza, locks e crypto.subtle di solito mancano');
+  try { add('localStorage accessibile', !!window.localStorage, 'accesso alla proprietà riuscito'); } catch (e) { add('localStorage accessibile', false, e.message); }
+  const hasIdb = typeof indexedDB !== 'undefined' && !!indexedDB;
+  add('indexedDB', hasIdb, hasIdb ? 'presente' : 'assente');
+  add('indexedDB.databases()', hasIdb && typeof indexedDB.databases === 'function', hasIdb && typeof indexedDB.databases === 'function' ? 'presente' : 'assente');
+  const hasLocks = !!(navigator.locks && typeof navigator.locks.request === 'function');
+  add('navigator.locks', hasLocks, hasLocks ? 'presente' : 'assente');
+  if (hasLocks) {
+    try {
+      const res = await Promise.race([
+        navigator.locks.request('proto_diag_lock', { mode: 'exclusive' }, async () => navigator.locks.request('proto_diag_lock', { mode: 'exclusive', ifAvailable: true }, l => l === null ? 'ok' : 'concesso-due-volte')),
+        new Promise(r => setTimeout(() => r('timeout'), 4000))]);
+      add('Prova del blocco esclusivo', res === 'ok', res === 'ok' ? 'un blocco già tenuto viene rifiutato, come atteso' : 'esito: ' + res);
+    } catch (e) { add('Prova del blocco esclusivo', false, e.message); }
+  } else add('Prova del blocco esclusivo', false, 'non eseguibile: navigator.locks assente');
+  if (window.crypto && crypto.subtle && typeof crypto.subtle.digest === 'function') {
+    try { const h = await sha('abc'); add('crypto.subtle.digest (SHA-256)', h === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad', h === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad' ? 'valore di prova corretto' : 'valore di prova ERRATO'); }
+    catch (e) { add('crypto.subtle.digest (SHA-256)', false, e.message); }
+  } else add('crypto.subtle.digest (SHA-256)', false, 'assente');
+  try { if (navigator.storage && navigator.storage.estimate) { const e = await navigator.storage.estimate(); add('Stima dello spazio (informativa)', true, 'usato ' + e.usage + ' B su ' + e.quota + ' B', false); } else add('Stima dello spazio (informativa)', false, 'non disponibile', false); } catch (e) { add('Stima dello spazio (informativa)', false, e.message, false); }
+  try { if (navigator.storage && navigator.storage.persisted) add('Archiviazione persistente (informativa)', true, String(await navigator.storage.persisted()), false); else add('Archiviazione persistente (informativa)', false, 'non disponibile', false); } catch (e) { add('Archiviazione persistente (informativa)', false, e.message, false); }
+  d.ok = items.filter(i => i.richiesto).every(i => i.ok);
+  d.mancanti = items.filter(i => i.richiesto && !i.ok).map(i => i.nome);
+  return d;
+}
+let lastDiag = null;
+function renderDiag(d) {
+  document.getElementById('diag').innerHTML = '<p><b class="' + (d.ok ? 'ok' : 'ko') + '">' + (d.ok ? '✔ Tutte le funzioni necessarie sono disponibili' : '✘ Mancano funzioni necessarie: ' + esc(d.mancanti.join('; '))) + '</b></p><p class="muted">Indirizzo: ' + esc(d.origin) + '</p><ul>'
+    + d.items.map(i => '<li>' + (i.ok ? '✔' : (i.richiesto ? '✘' : '–')) + ' ' + esc(i.nome) + ' — ' + esc(i.dettaglio) + '</li>').join('') + '</ul>'
+    + (d.ok ? '' : '<p class="warn">Un esito negativo con «contesto sicuro: NO» <b>non dimostra</b> che il browser sia incompatibile: riapri la pagina da un indirizzo HTTPS attendibile. Nessun archivio è stato creato o modificato.</p>');
+}
+const results = () => { try { return JSON.parse(lsGet(NS + 'SELFTEST_RESULTS') || '{}'); } catch (_) { return {}; } };
+const second = () => { try { return JSON.parse(lsGet(NS + 'SELFTEST_C2') || 'null'); } catch (_) { return null; } };
+function saveResult(k, v) { const r = results(); r[k] = { ...v, at: new Date().toISOString() }; localStorage.setItem(NS + 'SELFTEST_RESULTS', JSON.stringify(r)); }
+function verdetto() {
+  const r = results(), c2 = second();
+  const v = { A: r.A_andata_ritorno ? !!r.A_andata_ritorno.ok : null, B: r.B_riavvio ? !!r.B_riavvio.ok : null, C: r.C_importazione_lenta ? !!r.C_importazione_lenta.ok : null, C_seconda_scheda: c2 ? !!c2.tutte_rifiutate_come_in_corso : null };
+  v.complessivo = Object.values(v).every(x => x === true) ? 'SUPERATO' : Object.values(v).some(x => x === false) ? 'FALLITO' : 'INCOMPLETO';
+  return v;
+}
+function refreshReport() {
+  document.getElementById('report').value = JSON.stringify({ versione: 'prototipo rev. 2B', diagnostica: lastDiag, collaudo: results(), seconda_scheda: second(), verdetto: verdetto() }, null, 2);
+  const r = results();
+  document.getElementById('results').innerHTML = '<ul>' + [['A_andata_ritorno', 'A'], ['B_riavvio', 'B'], ['C_importazione_lenta', 'C']].map(([k, n]) => '<li>' + n + ': ' + (r[k] ? (r[k].ok ? '<b class="ok">✔ superato</b>' : '<b class="ko">✘ FALLITO</b>') + ' — ' + esc(r[k].dettaglio) : 'non eseguito') + '</li>').join('') + '</ul>';
+}
+const gout = m => { document.getElementById('guided-out').textContent = m; };
+async function needReady() { const g = gateCheck(); if (!g.ok) throw new Error(g.message); const st = await inspect(); if (st.name !== 'ready') throw new Error('stato «' + st.name + '»: ' + (st.message || 'archivio non pronto')); }
+const stateHash = async r => sha(canon({ v01: r.v01, units: r.units, cols: r.cols }));
+
+async function seed() {
+  const tag = Date.now().toString(36);
+  await setLegacy('v01', JSON.stringify({ tasks: [{ id: 't_' + tag, title: 'impegno di prova' }] })); await setLegacy('units', JSON.stringify([{ id: 'u_' + tag }]));
+  for (let i = 0; i < 3; i++) { await put('lessons', { rid: 'les_' + tag + '_' + i, title: 'lezione di prova ' + i }); await put('sources', { rid: 'src_' + tag + '_' + i, text: 'testo sintetico ' + i }); }
+  await put('attempts', { rid: 'att_' + tag }); return tag;
+}
+async function ensureSeed() { await needReady(); if (lsGet(K.V01) === null) await seed(); }
+async function stepA() {
+  await needReady(); const tag = await seed();
+  const s0 = await readAll(); if (!s0.ok) throw new Error('lettura iniziale: ' + JSON.stringify(s0));
+  const ex = await exportBackup(); if (!ex.ok) throw new Error('esportazione: ' + JSON.stringify(ex));
+  const h0 = await stateHash(s0);
+  await put('lessons', { rid: 'extra_' + tag, title: 'da annullare' });
+  const im = await importBackup(ex.backup); if (!im.ok) throw new Error('importazione: ' + JSON.stringify(im));
+  const s1 = await readAll(); const h1 = await stateHash(s1);
+  const ok = h0 === h1 && !s1.cols.lessons.some(l => l.rid === 'extra_' + tag) && lsGet(K.J) === null;
+  return { ok, dettaglio: ok ? 'esportato, modificato, importato: stato identico all\'esportato; giornale ripulito; generazione ' + im.gen : 'lo stato dopo l\'importazione è diverso da quello esportato' };
+}
+async function stepBStart() {
+  await ensureSeed(); const tag = Date.now().toString(36);
+  const ex0 = await exportBackup(); if (!ex0.ok) throw new Error('esportazione: ' + JSON.stringify(ex0));
+  await put('lessons', { rid: 'stepB_' + tag, title: 'deve sopravvivere al ripristino' });
+  const s2 = await readAll(); const expect = await stateHash(s2);
+  localStorage.setItem(NS + 'SELFTEST_B', JSON.stringify({ expect, tag, at: new Date().toISOString() }));
+  window.__fault = { at: 'P4b', mode: 'crash' };
+  let esito; try { esito = await importBackup(ex0.backup); } catch (e) { esito = { crash: e.message }; }
+  window.__fault = null; return esito;
+}
+async function stepBVerify() {
+  const raw = lsGet(NS + 'SELFTEST_B'); if (!raw) return null; const b = JSON.parse(raw); if (b.done) return null;
+  const s = await readAll(); const ok = !!s.ok && (await stateHash(s)) === b.expect && lsGet(K.J) === null;
+  let rec = null; try { rec = JSON.parse(lsGet(K.LOG) || 'null'); } catch (_) { }
+  b.done = true; localStorage.setItem(NS + 'SELFTEST_B', JSON.stringify(b));
+  const r = { ok, dettaglio: ok ? 'dopo l\'interruzione e il riavvio lo stato è quello di prima; recupero eseguito: ' + (rec && rec.action) : 'stato diverso da quello di prima o giornale rimasto' };
+  saveResult('B_riavvio', r); return r;
+}
+async function stepC() {
+  await ensureSeed(); localStorage.removeItem(NS + 'SELFTEST_C2');
+  const ex = await exportBackup(); if (!ex.ok) throw new Error('esportazione: ' + JSON.stringify(ex));
+  await put('lessons', { rid: 'stepC_' + Date.now().toString(36), title: 'C' });
+  window.__fault = { at: 'P4a', mode: 'pause' };
+  const p = importBackup(ex.backup);
+  for (let i = 0; i < 100 && window.__paused !== 'P4a'; i++) await new Promise(r => setTimeout(r, 100));
+  if (window.__paused !== 'P4a') { window.__fault = null; throw new Error('l\'importazione non è arrivata alla pausa'); }
+  let left = Math.ceil(SLOW_MS / 1000);
+  const iv = setInterval(() => { left--; gout('Importazione IN CORSO (in pausa a metà). Apri ORA una seconda scheda e premi «Seconda scheda: prova». Restano ' + Math.max(left, 0) + ' s.'); }, 1000);
+  gout('Importazione IN CORSO (in pausa a metà). Apri ORA una seconda scheda e premi «Seconda scheda: prova». Restano ' + left + ' s.');
+  await new Promise(r => setTimeout(r, SLOW_MS)); clearInterval(iv);
+  window.__resume(); const res = await p; window.__fault = null;
+  return { ok: !!res.ok, dettaglio: res.ok ? 'importazione completata dopo la pausa; esito della seconda scheda nel rapporto' : 'importazione fallita: ' + JSON.stringify(res).slice(0, 120) };
+}
+async function probe2() {
+  const a = await readAll(), b = await put('lessons', { rid: 'intruso_' + Date.now().toString(36) }), c = await setLegacy('v01', undefined), d = await exportBackup(), e = await status();
+  const busy = x => !!(x && x.busy);
+  const r = { at: new Date().toISOString(), lettura_in_corso: busy(a), scrittura_in_corso: busy(b), impegni_in_corso: busy(c), esportazione_in_corso: busy(d), stato_in_corso: busy(e), tutte_rifiutate_come_in_corso: busy(a) && busy(b) && busy(c) && busy(d) && busy(e) };
+  localStorage.setItem(NS + 'SELFTEST_C2', JSON.stringify(r)); return r;
+}
+function wire(id, fn) { const el = document.getElementById(id); el.onclick = async () => { el.disabled = true; try { await fn(); } catch (e) { gout('✘ ' + e.message); } finally { el.disabled = false; refreshReport(); } }; }
+wire('g-diag', async () => { lastDiag = await diagnose(); renderDiag(lastDiag); });
+wire('g-report', async () => { });
+wire('g-a', async () => { gout('A in corso…'); const r = await stepA(); saveResult('A_andata_ritorno', r); gout((r.ok ? '✔ A superato: ' : '✘ A FALLITO: ') + r.dettaglio); });
+wire('g-b', async () => {
+  gout('B: preparo e simulo l\'interruzione…'); const e = await stepBStart();
+  if (e.crash !== 'CRASH_SIMULATO') throw new Error('l\'interruzione simulata non è avvenuta: ' + JSON.stringify(e).slice(0, 150));
+  gout('Interruzione simulata a metà importazione. ORA premi «Ricarica la pagina» (o chiudi e riapri la scheda): il verdetto di B compare dopo il riavvio.'); document.getElementById('g-reload').hidden = false;
+});
+document.getElementById('g-reload').onclick = () => location.reload();
+wire('g-c', async () => { const r = await stepC(); saveResult('C_importazione_lenta', r); gout((r.ok ? '✔ C: ' : '✘ C FALLITO: ') + r.dettaglio); });
+wire('g-probe', async () => { const r = await probe2(); gout(r.tutte_rifiutate_come_in_corso ? '✔ Seconda scheda: lettura, scrittura, impegni ed esportazione sono stati tutti rifiutati come «operazione in corso».' : '✘ Seconda scheda: NON tutto è stato rifiutato (o l\'importazione era già finita): ' + JSON.stringify(r)); });
+window.PROTO.ready.then(async () => {
+  lastDiag = await diagnose(); renderDiag(lastDiag);
+  if (lastDiag.ok) { const v = await stepBVerify(); if (v) gout((v.ok ? '✔ B superato: ' : '✘ B FALLITO: ') + v.dettaglio); }
+  refreshReport();
+}, e => { document.getElementById('diag').textContent = 'errore all\'avvio: ' + e.message; });
+})();
+</script>
+</body>
+</html>
